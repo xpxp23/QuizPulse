@@ -120,7 +120,6 @@ fn grade_fill_blank(question: &Question, user_answers: &[String]) -> RawGradeOut
     let mut earned = 0usize;
 
     if question.order_insensitive {
-        // Greedy matching: each expected blank slot can only be consumed once.
         let mut used_expected = vec![false; total];
         for (i, user_val) in user_answers.iter().take(total).enumerate() {
             for (j, exp_spec) in question.answers.iter().enumerate() {
@@ -170,7 +169,6 @@ fn grade_short_answer(
         .collect();
 
     if points.is_empty() {
-        // Fallback: compare against reference answer if no keywords were specified
         let ref_norm = question
             .answers
             .first()
@@ -254,6 +252,7 @@ mod tests {
             correct_count: 0,
             next_review_at: String::new(),
             status: "active".into(),
+            round_num: 0,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -267,7 +266,11 @@ mod tests {
             "可靠性/可靠传输".into(),
             "流量控制/滑动窗口".into(),
         ];
-        let res = evaluate_question(&q, &["TCP通过3次握手建立连接，并利用滑动窗口实现控制".into()], 60);
+        let res = evaluate_question(
+            &q,
+            &["TCP通过3次握手建立连接，并利用滑动窗口实现控制".into()],
+            60,
+        );
         assert!(res.is_correct);
         assert_eq!(res.earned_points, 2);
         assert_eq!(res.total_points, 3);

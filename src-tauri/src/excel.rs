@@ -1,8 +1,9 @@
-use crate::db::{ensure_bank_by_name, list_questions, now_iso};
+use crate::db::{ensure_bank_by_name, list_all_questions_by_bank, now_iso, random_shuffle_key};
 use crate::models::{ChoiceOption, ImportSummary, QuestionType};
 use calamine::{open_workbook, Reader, Xlsx};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_xlsxwriter::{Color, DataValidation, Format, FormatAlign, FormatBorder, Workbook};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const HEADERS: [&str; 14] = [
@@ -22,7 +23,7 @@ const HEADERS: [&str; 14] = [
     "解析",
 ];
 
-/// Export either a blank standard template (with 4 example rows) or an existing bank's questions (with IDs for lossless updates).
+/// Export either a blank standard template (4 examples) or ALL questions of an existing bank (zero LIMIT truncation).
 pub fn export_excel_template(
     conn: &Connection,
     target_path: &str,
@@ -70,25 +71,12 @@ pub fn export_excel_template(
             .map_err(|e| e.to_string())?;
     }
 
-    // Add dropdown validations for rows 2..2001
-    let type_dv = DataValidation::new()
-        .allow_list_strings(&["单选", "多选", "填空", "简答"])
-        .map_err(|e| e.to_string())?;
-    sheet
-        .add_data_validation(1, 2, 2000, 2, &type_dv)
-        .map_err(|e| e.to_string())?;
-
-    let order_dv = DataValidation::new()
-        .allow_list_strings(&["否", "是"])
-        .map_err(|e| e.to_string())?;
-    sheet
-        .add_data_validation(1, 12, 2000, 12, &order_dv)
-        .map_err(|e| e.to_string())?;
-
     let exported_count: usize;
+    let max_dv_row: u32;
     if let Some(bid) = bank_id.filter(|s| !s.is_empty()) {
-        let questions = list_questions(conn, Some(bid), None, None)?;
+        let questions = list_all_questions_by_bank(conn, bid)?;
         exported_count = questions.len();
+        max_dv_row = (exported_count + 2000) as u32;
         for (i, q) in questions.iter().enumerate() {
             let row = (i + 1) as u32;
             let opt_by_key = |k: &str| -> String {
@@ -130,7 +118,6 @@ pub fn export_excel_template(
             }
         }
     } else {
-        // Blank template with 4 clear example rows
         let examples = [
             [
                 "",
@@ -198,6 +185,7 @@ pub fn export_excel_template(
             ],
         ];
         exported_count = examples.len();
+        max_dv_row = 2000;
         for (i, row_vals) in examples.iter().enumerate() {
             let row = (i + 1) as u32;
             for (c, val) in row_vals.iter().enumerate() {
@@ -209,7 +197,20 @@ pub fn export_excel_template(
         }
     }
 
-    // Add second sheet: Instructions
+    let type_dv = DataValidation::new()
+        .allow_list_strings(&["单选", "多选", "填空", "简答"])
+        .map_err(|e| e.to_string())?;
+    sheet
+        .add_data_validation(1, 2, max_dv_row, 2, &type_dv)
+        .map_err(|e| e.to_string())?;
+
+    let order_dv = DataValidation::new()
+        .allow_list_strings(&["否", "是"])
+        .map_err(|e| e.to_string())?;
+    sheet
+        .add_data_validation(1, 12, max_dv_row, 12, &order_dv)
+        .map_err(|e| e.to_string())?;
+
     let guide = workbook.add_worksheet();
     guide.set_name("填写说明").map_err(|e| e.to_string())?;
     guide.set_column_width(0, 24.0).map_err(|e| e.to_string())?;
@@ -251,11 +252,17 @@ fn split_points(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Strictly extract unique A-F option keys in order (fixes accidental extraction of arbitrary English words).
 fn parse_choice_answers(raw: &str) -> Vec<String> {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphabetic())
-        .map(|c| c.to_ascii_uppercase().to_string())
-        .collect()
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for ch in raw.chars() {
+        let up = ch.to_ascii_uppercase();
+        if matches!(up, 'A' | 'B' | 'C' | 'D' | 'E' | 'F') && seen.insert(up) {
+            out.push(up.to_string());
+        }
+    }
+    out
 }
 
 /// Lossless incremental Excel import inside a single SQLite transaction.
@@ -293,7 +300,6 @@ pub fn import_excel_file(
         let q_type_cell = cell_str(row, 2);
         let stem = cell_str(row, 3);
 
-        // Skip completely empty rows silently
         if raw_id.is_empty() && q_type_cell.is_empty() && stem.is_empty() {
             continue;
         }
@@ -337,7 +343,11 @@ pub fn import_excel_file(
         let explanation = cell_str(row, 13);
 
         let answers = match q_type {
-            QuestionType::SingleChoice | QuestionType::MultiChoice => parse_choice_answers(&raw_answer),
+            QuestionType::SingleChoice => {
+                let parsed = parse_choice_answers(&raw_answer);
+                parsed.into_iter().take(1).collect()
+            }
+            QuestionType::MultiChoice => parse_choice_answers(&raw_answer),
             QuestionType::FillBlank => split_points(&raw_answer),
             QuestionType::ShortAnswer => {
                 if raw_answer.is_empty() {
@@ -355,7 +365,7 @@ pub fn import_excel_file(
         {
             summary.skipped += 1;
             summary.errors.push(format!(
-                "第 {excel_row_num} 行选择题至少需要 2 个选项且填写标准答案"
+                "第 {excel_row_num} 行选择题至少需要 2 个选项且填写标准答案（A-F）"
             ));
             continue;
         }
@@ -376,7 +386,6 @@ pub fn import_excel_file(
         let ans_json = serde_json::to_string(&answers).unwrap_or_else(|_| "[]".into());
         let kw_json = serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into());
 
-        // Check if existing ID -> lossless update preserving Ebbinghaus & cleared state
         let exists = if !raw_id.is_empty() {
             tx.query_row(
                 "SELECT id FROM questions WHERE id = ?1",
@@ -418,11 +427,13 @@ pub fn import_excel_file(
             } else {
                 raw_id
             };
+            let sk = random_shuffle_key();
             tx.execute(
                 "INSERT INTO questions (
                     id, bank_id, q_type, stem, options_json, answer_json, keywords_json,
-                    explanation, order_insensitive, next_review_at, status, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', ?10, ?10)",
+                    explanation, order_insensitive, next_review_at, status, round_num, shuffle_key,
+                    created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', 0, ?11, ?10, ?10)",
                 params![
                     new_id,
                     bank_id,
@@ -433,7 +444,8 @@ pub fn import_excel_file(
                     kw_json,
                     explanation,
                     i64::from(order_insensitive),
-                    now
+                    now,
+                    sk
                 ],
             )
             .map_err(|e| e.to_string())?;

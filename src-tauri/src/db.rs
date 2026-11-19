@@ -1,10 +1,13 @@
 use crate::models::{
-    AppSettings, Bank, ChoiceOption, DashboardStats, Question, QuestionType, QuizSessionQuestion,
+    AppSettings, Bank, ChoiceOption, DashboardStats, HeatmapDay, PaginatedQuestions, Question,
+    QuestionType, QuestionUpsertRequest, QuizSessionQuestion, ReviewSnapshot, RoundProgress,
 };
-use chrono::{Duration, Local, NaiveDateTime};
+use chrono::{Duration, Local};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -37,34 +40,38 @@ impl DbState {
         })
     }
 
+    /// Safely migrate database to a new directory using SQLite's native VACUUM INTO
+    /// (avoids Windows file-lock sharing violations and incomplete WAL copies).
     pub fn switch_data_dir(&self, new_dir: &str) -> Result<String, String> {
         let target = PathBuf::from(new_dir.trim());
         fs::create_dir_all(&target).map_err(|e| format!("无法访问目标目录: {e}"))?;
-
-        let old_dir = self
-            .data_dir
-            .lock()
-            .map_err(|_| "锁获取失败".to_string())?
-            .clone();
-        let old_db = old_dir.join("quizpulse.db");
         let new_db = target.join("quizpulse.db");
 
-        // Flush WAL and copy existing database if target doesn't already contain one
         {
-            let conn = self.conn.lock().map_err(|_| "数据库锁获取失败".to_string())?;
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        }
-        if !new_db.exists() && old_db.exists() {
-            fs::copy(&old_db, &new_db).map_err(|e| format!("迁移数据库失败: {e}"))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁获取失败".to_string())?;
+            if !new_db.exists() {
+                let escaped = new_db.to_string_lossy().replace('\'', "''");
+                conn.execute_batch(&format!("VACUUM INTO '{escaped}';"))
+                    .map_err(|e| format!("迁移数据库快照失败: {e}"))?;
+            }
         }
 
         let new_conn = open_and_migrate(&new_db)?;
         {
-            let mut conn_guard = self.conn.lock().map_err(|_| "数据库锁获取失败".to_string())?;
+            let mut conn_guard = self
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁获取失败".to_string())?;
             *conn_guard = new_conn;
         }
         {
-            let mut dir_guard = self.data_dir.lock().map_err(|_| "目录锁获取失败".to_string())?;
+            let mut dir_guard = self
+                .data_dir
+                .lock()
+                .map_err(|_| "目录锁获取失败".to_string())?;
             *dir_guard = target.clone();
         }
         save_bootstrap_data_dir(&target)?;
@@ -85,9 +92,8 @@ fn resolve_data_dir() -> Result<PathBuf, String> {
     if cfg_path.exists() {
         if let Ok(raw) = fs::read_to_string(&cfg_path) {
             if let Ok(cfg) = serde_json::from_str::<BootstrapConfig>(&raw) {
-                let p = PathBuf::from(cfg.data_dir.trim());
                 if !cfg.data_dir.trim().is_empty() {
-                    return Ok(p);
+                    return Ok(PathBuf::from(cfg.data_dir.trim()));
                 }
             }
         }
@@ -107,6 +113,18 @@ fn save_bootstrap_data_dir(dir: &Path) -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
     fs::write(cfg_path, payload).map_err(|e| format!("写入目录配置失败: {e}"))
+}
+
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(names.iter().any(|n| n == col))
 }
 
 fn open_and_migrate(db_path: &Path) -> Result<Connection, String> {
@@ -142,6 +160,8 @@ fn open_and_migrate(db_path: &Path) -> Result<Connection, String> {
             correct_count INTEGER NOT NULL DEFAULT 0,
             next_review_at TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
+            round_num INTEGER NOT NULL DEFAULT 0,
+            shuffle_key REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (bank_id) REFERENCES banks(id) ON DELETE CASCADE
@@ -169,12 +189,144 @@ fn open_and_migrate(db_path: &Path) -> Result<Connection, String> {
     )
     .map_err(|e| format!("数据库初始化失败: {e}"))?;
 
+    // Smooth migration for existing v1.0 databases
+    let mut needs_initial_shuffle = false;
+    if !column_exists(&conn, "questions", "round_num")? {
+        conn.execute(
+            "ALTER TABLE questions ADD COLUMN round_num INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("迁移 round_num 列失败: {e}"))?;
+        needs_initial_shuffle = true;
+    }
+    if !column_exists(&conn, "questions", "shuffle_key")? {
+        conn.execute(
+            "ALTER TABLE questions ADD COLUMN shuffle_key REAL NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("迁移 shuffle_key 列失败: {e}"))?;
+        needs_initial_shuffle = true;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_questions_round ON questions(status, round_num, shuffle_key)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     seed_demo_data_if_empty(&conn)?;
+
+    // Ensure every question with shuffle_key = 0 gets a valid random key
+    if needs_initial_shuffle {
+        assign_missing_shuffle_keys(&conn)?;
+    }
+
     Ok(conn)
 }
 
 pub fn now_iso() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub fn random_shuffle_key() -> f64 {
+    rand::thread_rng().gen::<f64>()
+}
+
+fn assign_missing_shuffle_keys(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM questions WHERE shuffle_key = 0")
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut rng = rand::thread_rng();
+    for id in ids {
+        let key: f64 = rng.gen();
+        conn.execute(
+            "UPDATE questions SET shuffle_key = ?1 WHERE id = ?2",
+            params![key, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn get_current_round(conn: &Connection) -> Result<i64, String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'current_round'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(raw.and_then(|s| s.parse::<i64>().ok()).unwrap_or(1).max(1))
+}
+
+fn set_current_round(conn: &Connection, round: i64) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('current_round', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![round.to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Start a fresh shuffled round: increment round_num counter and Fisher-Yates shuffle all active questions.
+pub fn start_new_shuffle_round(conn: &Connection) -> Result<i64, String> {
+    let next_round = get_current_round(conn)? + 1;
+    let mut stmt = conn
+        .prepare("SELECT id FROM questions WHERE status = 'active'")
+        .map_err(|e| e.to_string())?;
+    let mut ids: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut rng = rand::thread_rng();
+    ids.shuffle(&mut rng);
+
+    for (idx, id) in ids.iter().enumerate() {
+        // Store strictly increasing keys in shuffled order (1.0, 2.0, ...) so tie-breaking is deterministic
+        let key = (idx + 1) as f64;
+        conn.execute(
+            "UPDATE questions SET shuffle_key = ?1 WHERE id = ?2",
+            params![key, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    set_current_round(conn, next_round)?;
+    Ok(next_round)
+}
+
+pub fn get_round_progress(conn: &Connection) -> Result<RoundProgress, String> {
+    let current_round = get_current_round(conn)?;
+    let (total_active, completed_in_round): (i64, i64) = conn
+        .query_row(
+            "SELECT
+                COUNT(*),
+                SUM(CASE WHEN q.round_num >= ?1 THEN 1 ELSE 0 END)
+             FROM questions q
+             JOIN banks b ON b.id = q.bank_id
+             WHERE b.enabled = 1 AND q.status = 'active'",
+            params![current_round],
+            |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(RoundProgress {
+        current_round,
+        completed_in_round,
+        total_active,
+    })
 }
 
 fn seed_demo_data_if_empty(conn: &Connection) -> Result<(), String> {
@@ -255,13 +407,16 @@ fn seed_demo_data_if_empty(conn: &Connection) -> Result<(), String> {
         ),
     ];
 
+    let mut rng = rand::thread_rng();
     for (id, q_type, stem, opts, ans, kw, exp, order_ins) in demo_rows {
+        let sk: f64 = rng.gen();
         conn.execute(
             "INSERT INTO questions (
                 id, bank_id, q_type, stem, options_json, answer_json, keywords_json,
-                explanation, order_insensitive, next_review_at, status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', ?10, ?10)",
-            params![id, bank_id, q_type, stem, opts, ans, kw, exp, order_ins, now],
+                explanation, order_insensitive, next_review_at, status, round_num, shuffle_key,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', 0, ?11, ?10, ?10)",
+            params![id, bank_id, q_type, stem, opts, ans, kw, exp, order_ins, now, sk],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -416,69 +571,160 @@ fn map_question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
         correct_count: r.get(13)?,
         next_review_at: r.get(14)?,
         status: r.get(15)?,
-        created_at: r.get(16)?,
-        updated_at: r.get(17)?,
+        round_num: r.get(16)?,
+        created_at: r.get(17)?,
+        updated_at: r.get(18)?,
     })
 }
 
-pub fn list_questions(
+const QUESTION_SELECT_COLS: &str = "
+    SELECT q.id, q.bank_id, b.name, q.q_type, q.stem, q.options_json, q.answer_json,
+           q.keywords_json, q.explanation, q.order_insensitive, q.ebbinghaus_stage,
+           q.streak, q.wrong_count, q.correct_count, q.next_review_at, q.status,
+           q.round_num, q.created_at, q.updated_at
+    FROM questions q
+    JOIN banks b ON b.id = q.bank_id
+";
+
+/// Paginated list for UI so even 10,000+ question banks render smoothly with zero truncation.
+pub fn list_questions_paginated(
     conn: &Connection,
     bank_id: Option<&str>,
     status: Option<&str>,
     keyword: Option<&str>,
-) -> Result<Vec<Question>, String> {
-    let mut sql = String::from(
-        "SELECT q.id, q.bank_id, b.name, q.q_type, q.stem, q.options_json, q.answer_json,
-                q.keywords_json, q.explanation, q.order_insensitive, q.ebbinghaus_stage,
-                q.streak, q.wrong_count, q.correct_count, q.next_review_at, q.status,
-                q.created_at, q.updated_at
-         FROM questions q
-         JOIN banks b ON b.id = q.bank_id
-         WHERE 1=1",
-    );
+    page: u32,
+    page_size: u32,
+) -> Result<PaginatedQuestions, String> {
+    let safe_page = page.max(1);
+    let safe_size = page_size.clamp(10, 200);
+    let offset = ((safe_page - 1) * safe_size) as i64;
+
+    let mut where_sql = String::from(" WHERE 1=1");
     let mut param_values: Vec<String> = Vec::new();
     if let Some(bid) = bank_id.filter(|s| !s.is_empty() && *s != "all") {
         param_values.push(bid.to_string());
-        sql.push_str(&format!(" AND q.bank_id = ?{}", param_values.len()));
+        where_sql.push_str(&format!(" AND q.bank_id = ?{}", param_values.len()));
     }
     if let Some(st) = status.filter(|s| !s.is_empty() && *s != "all") {
         if st == "wrong" {
-            sql.push_str(" AND q.status = 'active' AND q.wrong_count > 0");
+            where_sql.push_str(" AND q.status = 'active' AND q.wrong_count > 0");
         } else {
             param_values.push(st.to_string());
-            sql.push_str(&format!(" AND q.status = ?{}", param_values.len()));
+            where_sql.push_str(&format!(" AND q.status = ?{}", param_values.len()));
         }
     }
     if let Some(kw) = keyword.map(str::trim).filter(|s| !s.is_empty()) {
         param_values.push(format!("%{kw}%"));
         let idx = param_values.len();
-        sql.push_str(&format!(" AND (q.stem LIKE ?{idx} OR q.explanation LIKE ?{idx})"));
+        where_sql.push_str(&format!(" AND (q.stem LIKE ?{idx} OR q.explanation LIKE ?{idx})"));
     }
-    sql.push_str(" ORDER BY q.updated_at DESC LIMIT 500");
 
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM questions q JOIN banks b ON b.id = q.bank_id {where_sql}"
+    );
     let params_refs: Vec<&dyn rusqlite::ToSql> =
         param_values.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-    let rows = stmt
-        .query_map(params_refs.as_slice(), map_question_row)
+    let total: i64 = conn
+        .query_row(&count_sql, params_refs.as_slice(), |r| r.get(0))
         .map_err(|e| e.to_string())?;
 
+    let data_sql = format!(
+        "{QUESTION_SELECT_COLS} {where_sql} ORDER BY q.updated_at DESC LIMIT {} OFFSET {}",
+        safe_size, offset
+    );
+    let mut stmt = conn.prepare(&data_sql).map_err(|e| e.to_string())?;
+    let items = stmt
+        .query_map(params_refs.as_slice(), map_question_row)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(PaginatedQuestions {
+        items,
+        total,
+        page: safe_page,
+        page_size: safe_size,
+    })
+}
+
+/// Unbounded export query (fixes the v1.0 LIMIT 500 silent truncation bug!).
+pub fn list_all_questions_by_bank(conn: &Connection, bank_id: &str) -> Result<Vec<Question>, String> {
+    let sql = format!("{QUESTION_SELECT_COLS} WHERE q.bank_id = ?1 ORDER BY q.created_at ASC");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![bank_id], map_question_row)
+        .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 pub fn get_question_by_id(conn: &Connection, id: &str) -> Result<Question, String> {
-    conn.query_row(
-        "SELECT q.id, q.bank_id, b.name, q.q_type, q.stem, q.options_json, q.answer_json,
-                q.keywords_json, q.explanation, q.order_insensitive, q.ebbinghaus_stage,
-                q.streak, q.wrong_count, q.correct_count, q.next_review_at, q.status,
-                q.created_at, q.updated_at
-         FROM questions q
-         JOIN banks b ON b.id = q.bank_id
-         WHERE q.id = ?1",
-        params![id],
-        map_question_row,
+    let sql = format!("{QUESTION_SELECT_COLS} WHERE q.id = ?1");
+    conn.query_row(&sql, params![id], map_question_row)
+        .map_err(|e| format!("题目不存在: {e}"))
+}
+
+pub fn upsert_question(conn: &Connection, req: &QuestionUpsertRequest) -> Result<Question, String> {
+    if req.stem.trim().is_empty() {
+        return Err("题干不能为空".into());
+    }
+    let now = now_iso();
+    let opts_json = serde_json::to_string(&req.options).unwrap_or_else(|_| "[]".into());
+    let ans_json = serde_json::to_string(&req.answers).unwrap_or_else(|_| "[]".into());
+    let kw_json = serde_json::to_string(&req.keywords).unwrap_or_else(|_| "[]".into());
+
+    if let Some(existing_id) = req.id.as_deref().filter(|s| !s.trim().is_empty()) {
+        // Lossless update preserving Ebbinghaus & round state
+        let affected = conn
+            .execute(
+                "UPDATE questions
+                 SET bank_id = ?1, q_type = ?2, stem = ?3, options_json = ?4,
+                     answer_json = ?5, keywords_json = ?6, explanation = ?7,
+                     order_insensitive = ?8, updated_at = ?9
+                 WHERE id = ?10",
+                params![
+                    req.bank_id,
+                    req.q_type.as_str(),
+                    req.stem.trim(),
+                    opts_json,
+                    ans_json,
+                    kw_json,
+                    req.explanation.trim(),
+                    i64::from(req.order_insensitive),
+                    now,
+                    existing_id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if affected > 0 {
+            return get_question_by_id(conn, existing_id);
+        }
+    }
+
+    let new_id = format!("q_{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let sk = random_shuffle_key();
+    conn.execute(
+        "INSERT INTO questions (
+            id, bank_id, q_type, stem, options_json, answer_json, keywords_json,
+            explanation, order_insensitive, next_review_at, status, round_num, shuffle_key,
+            created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', 0, ?11, ?10, ?10)",
+        params![
+            new_id,
+            req.bank_id,
+            req.q_type.as_str(),
+            req.stem.trim(),
+            opts_json,
+            ans_json,
+            kw_json,
+            req.explanation.trim(),
+            i64::from(req.order_insensitive),
+            now,
+            sk
+        ],
     )
-    .map_err(|e| format!("题目不存在: {e}"))
+    .map_err(|e| e.to_string())?;
+
+    get_question_by_id(conn, &new_id)
 }
 
 pub fn delete_question(conn: &Connection, id: &str) -> Result<(), String> {
@@ -490,11 +736,12 @@ pub fn delete_question(conn: &Connection, id: &str) -> Result<(), String> {
 pub fn set_question_status(conn: &Connection, id: &str, status: &str) -> Result<(), String> {
     let now = now_iso();
     if status == "active" {
-        // Restored from cleared bank -> reset review due immediately so it re-enters queue
+        let sk = random_shuffle_key();
         conn.execute(
             "UPDATE questions SET status = 'active', ebbinghaus_stage = 0, streak = 0,
-                    next_review_at = ?1, updated_at = ?1 WHERE id = ?2",
-            params![now, id],
+                    round_num = 0, shuffle_key = ?1, next_review_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+            params![sk, now, id],
         )
         .map_err(|e| e.to_string())?;
     } else {
@@ -507,47 +754,34 @@ pub fn set_question_status(conn: &Connection, id: &str, status: &str) -> Result<
     Ok(())
 }
 
-/// Pick N questions for a timed popup session:
-/// Priority 1: Due review/wrong questions (status='active', bank enabled, next_review_at <= now, highest wrong_count first)
-/// Priority 2: Unseen new questions (correct_count=0 AND wrong_count=0)
-/// Priority 3: Upcoming active questions sorted by earliest next_review_at
-pub fn pick_session_questions(
-    conn: &Connection,
-    count: usize,
-    shuffle_options: bool,
-) -> Result<Vec<QuizSessionQuestion>, String> {
-    let now = now_iso();
-    let limit = count.max(1) as i64;
-    let mut stmt = conn
-        .prepare(
-            "SELECT q.id, q.bank_id, b.name, q.q_type, q.stem, q.options_json, q.answer_json,
-                    q.keywords_json, q.explanation, q.order_insensitive, q.ebbinghaus_stage,
-                    q.streak, q.wrong_count, q.correct_count, q.next_review_at, q.status,
-                    q.created_at, q.updated_at
-             FROM questions q
-             JOIN banks b ON b.id = q.bank_id
-             WHERE b.enabled = 1 AND q.status = 'active'
-             ORDER BY
-                CASE
-                    WHEN q.next_review_at <= ?1 AND q.wrong_count > 0 THEN 0
-                    WHEN q.next_review_at <= ?1 THEN 1
-                    WHEN q.correct_count = 0 AND q.wrong_count = 0 THEN 2
-                    ELSE 3
-                END ASC,
-                q.wrong_count DESC,
-                q.next_review_at ASC
-             LIMIT ?2",
+/// Skip a question without getting stuck in an infinite loop:
+/// - Push its shuffle_key to the end of the current round (MAX + 1.0) so it won't pop immediately again
+/// - Push its next_review_at forward by 30 minutes
+pub fn skip_question(conn: &Connection, id: &str) -> Result<(), String> {
+    let max_key: f64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(shuffle_key), 1.0) FROM questions WHERE status = 'active'",
+            [],
+            |r| r.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .unwrap_or(1.0);
+    let defer_at = (Local::now() + Duration::minutes(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    conn.execute(
+        "UPDATE questions SET shuffle_key = ?1, next_review_at = ?2 WHERE id = ?3",
+        params![max_key + 1.0, defer_at, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
-    let questions: Vec<Question> = stmt
-        .query_map(params![now, limit], map_question_row)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-
+fn wrap_session_questions(
+    questions: Vec<Question>,
+    shuffle_options: bool,
+) -> Vec<QuizSessionQuestion> {
     let mut rng = rand::thread_rng();
-    let session = questions
+    questions
         .into_iter()
         .map(|q| {
             let mut display_options = q.options.clone();
@@ -562,22 +796,221 @@ pub fn pick_session_questions(
                 display_options,
             }
         })
-        .collect();
-
-    Ok(session)
+        .collect()
 }
 
-/// Apply Ebbinghaus interval update after answering (or manual override).
-/// Returns (auto_cleared, next_review_at, new_stage, new_streak).
+/// Unified question selector supporting 3 modes:
+/// 1. "shuffle_round": True Shuffle-Bag (without replacement per round; finishes all active questions before reshuffling)
+/// 2. "ebbinghaus": Due wrong -> due review -> random unseen -> earliest upcoming
+/// 3. "sequential": Strict insertion order per round
+pub fn pick_session_questions(
+    conn: &Connection,
+    count: usize,
+    settings: &AppSettings,
+    bank_id_filter: Option<&str>,
+    wrong_only: bool,
+) -> Result<Vec<QuizSessionQuestion>, String> {
+    let need = count.max(1);
+    let now = now_iso();
+
+    // Focus mode: wrong-only blitz
+    if wrong_only {
+        let mut sql = format!(
+            "{QUESTION_SELECT_COLS} WHERE q.status = 'active' AND q.wrong_count > 0"
+        );
+        let mut q_list: Vec<Question> = if let Some(bid) = bank_id_filter.filter(|s| !s.is_empty() && *s != "all") {
+            sql.push_str(" AND q.bank_id = ?1 ORDER BY q.wrong_count DESC, q.shuffle_key ASC LIMIT ?2");
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![bid, need as i64], map_question_row)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            rows
+        } else {
+            sql.push_str(" AND b.enabled = 1 ORDER BY q.wrong_count DESC, q.shuffle_key ASC LIMIT ?1");
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![need as i64], map_question_row)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            rows
+        };
+        if settings.study_order == "shuffle_round" {
+            q_list.shuffle(&mut rand::thread_rng());
+        }
+        return Ok(wrap_session_questions(q_list, settings.shuffle_options));
+    }
+
+    if settings.study_order == "ebbinghaus" {
+        let list: Vec<Question> =
+            if let Some(bid) = bank_id_filter.filter(|s| !s.is_empty() && *s != "all") {
+                let sql = format!(
+                    "{QUESTION_SELECT_COLS}
+                     WHERE q.bank_id = ?1 AND q.status = 'active'
+                     ORDER BY
+                        CASE
+                            WHEN q.next_review_at <= ?2 AND q.wrong_count > 0 THEN 0
+                            WHEN q.next_review_at <= ?2 AND (q.correct_count > 0 OR q.wrong_count > 0) THEN 1
+                            WHEN q.correct_count = 0 AND q.wrong_count = 0 THEN 2
+                            ELSE 3
+                        END ASC,
+                        q.wrong_count DESC,
+                        q.shuffle_key ASC,
+                        q.next_review_at ASC
+                     LIMIT ?3"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map(params![bid, now, need as i64], map_question_row)
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            } else {
+                let sql = format!(
+                    "{QUESTION_SELECT_COLS}
+                     WHERE b.enabled = 1 AND q.status = 'active'
+                     ORDER BY
+                        CASE
+                            WHEN q.next_review_at <= ?1 AND q.wrong_count > 0 THEN 0
+                            WHEN q.next_review_at <= ?1 AND (q.correct_count > 0 OR q.wrong_count > 0) THEN 1
+                            WHEN q.correct_count = 0 AND q.wrong_count = 0 THEN 2
+                            ELSE 3
+                        END ASC,
+                        q.wrong_count DESC,
+                        q.shuffle_key ASC,
+                        q.next_review_at ASC
+                     LIMIT ?2"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map(params![now, need as i64], map_question_row)
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            };
+        return Ok(wrap_session_questions(list, settings.shuffle_options));
+    }
+
+    // Shuffle-Bag ("shuffle_round") or Round-based Sequential ("sequential")
+    let mut picked: Vec<Question> = Vec::with_capacity(need);
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    // Optional: interleave at most 1 due wrong question first so mistakes still get reinforced
+    if settings.interleave_due_wrong {
+        let wrong_sql = if let Some(_) = bank_id_filter.filter(|s| !s.is_empty() && *s != "all") {
+            format!(
+                "{QUESTION_SELECT_COLS}
+                 WHERE q.bank_id = ?1 AND q.status = 'active'
+                   AND q.wrong_count > 0 AND q.next_review_at <= ?2
+                 ORDER BY q.wrong_count DESC, q.next_review_at ASC
+                 LIMIT 1"
+            )
+        } else {
+            format!(
+                "{QUESTION_SELECT_COLS}
+                 WHERE b.enabled = 1 AND q.status = 'active'
+                   AND q.wrong_count > 0 AND q.next_review_at <= ?1
+                 ORDER BY q.wrong_count DESC, q.next_review_at ASC
+                 LIMIT 1"
+            )
+        };
+        let mut stmt = conn.prepare(&wrong_sql).map_err(|e| e.to_string())?;
+        let due_wrong: Option<Question> =
+            if let Some(bid) = bank_id_filter.filter(|s| !s.is_empty() && *s != "all") {
+                stmt.query_row(params![bid, now], map_question_row)
+                    .optional()
+                    .map_err(|e| e.to_string())?
+            } else {
+                stmt.query_row(params![now], map_question_row)
+                    .optional()
+                    .map_err(|e| e.to_string())?
+            };
+        if let Some(wq) = due_wrong {
+            seen_ids.insert(wq.id.clone());
+            picked.push(wq);
+        }
+    }
+
+    let order_by = if settings.study_order == "sequential" {
+        "q.created_at ASC, q.id ASC"
+    } else {
+        "q.shuffle_key ASC"
+    };
+
+    // Helper closure to pull remaining questions for a given round
+    let query_round = |conn: &Connection, round: i64, limit: usize| -> Result<Vec<Question>, String> {
+        if let Some(bid) = bank_id_filter.filter(|s| !s.is_empty() && *s != "all") {
+            let sql = format!(
+                "{QUESTION_SELECT_COLS}
+                 WHERE q.bank_id = ?1 AND q.status = 'active' AND q.round_num < ?2
+                 ORDER BY {order_by}
+                 LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![bid, round, limit as i64], map_question_row)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        } else {
+            let sql = format!(
+                "{QUESTION_SELECT_COLS}
+                 WHERE b.enabled = 1 AND q.status = 'active' AND q.round_num < ?1
+                 ORDER BY {order_by}
+                 LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![round, limit as i64], map_question_row)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        }
+    };
+
+    let current_round = get_current_round(conn)?;
+    if picked.len() < need {
+        let batch1 = query_round(conn, current_round, need + 2)?;
+        for q in batch1 {
+            if picked.len() >= need {
+                break;
+            }
+            if seen_ids.insert(q.id.clone()) {
+                picked.push(q);
+            }
+        }
+    }
+
+    // If current round is exhausted and we still need more questions, advance to next round & reshuffle!
+    if picked.len() < need {
+        let next_round = start_new_shuffle_round(conn)?;
+        let batch2 = query_round(conn, next_round, need + 2)?;
+        for q in batch2 {
+            if picked.len() >= need {
+                break;
+            }
+            if seen_ids.insert(q.id.clone()) {
+                picked.push(q);
+            }
+        }
+    }
+
+    Ok(wrap_session_questions(picked, settings.shuffle_options))
+}
+
+/// Apply Ebbinghaus interval update + mark current round_num after answering.
+/// Returns (auto_cleared, next_review_at, new_stage, new_streak, snapshot_for_override).
 pub fn record_review_outcome(
     conn: &Connection,
     question_id: &str,
     is_correct: bool,
     score_percent: u8,
-    manual_override: bool,
     auto_clear_streak: i32,
-) -> Result<(bool, String, i32, i32), String> {
+) -> Result<(bool, String, i32, i32, ReviewSnapshot), String> {
     let q = get_question_by_id(conn, question_id)?;
+    let current_round = get_current_round(conn)?;
     let now_dt = Local::now();
     let now_str = now_dt.format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -598,7 +1031,6 @@ pub fn record_review_outcome(
                 should_clear,
             )
         } else {
-            // Wrong answer -> reset streak & stage, boost frequency to 20 minutes later
             (
                 0,
                 0,
@@ -614,8 +1046,8 @@ pub fn record_review_outcome(
     conn.execute(
         "UPDATE questions
          SET ebbinghaus_stage = ?1, streak = ?2, wrong_count = ?3, correct_count = ?4,
-             next_review_at = ?5, status = ?6, updated_at = ?7
-         WHERE id = ?8",
+             next_review_at = ?5, status = ?6, round_num = MAX(round_num, ?7), updated_at = ?8
+         WHERE id = ?9",
         params![
             new_stage,
             new_streak,
@@ -623,6 +1055,7 @@ pub fn record_review_outcome(
             new_correct,
             next_str,
             new_status,
+            current_round,
             now_str,
             question_id
         ],
@@ -631,18 +1064,80 @@ pub fn record_review_outcome(
 
     conn.execute(
         "INSERT INTO review_logs (question_id, is_correct, score_percent, manual_override, reviewed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         VALUES (?1, ?2, ?3, 0, ?4)",
         params![
             question_id,
             i64::from(is_correct),
             i64::from(score_percent),
-            i64::from(manual_override),
             now_str
         ],
     )
     .map_err(|e| e.to_string())?;
 
-    Ok((auto_cleared, next_str, new_stage, new_streak))
+    let log_id = conn.last_insert_rowid();
+    let snapshot = ReviewSnapshot {
+        log_id,
+        prev_stage: q.ebbinghaus_stage,
+        prev_streak: q.streak,
+        prev_wrong_count: q.wrong_count,
+        prev_correct_count: q.correct_count,
+        prev_status: q.status,
+        prev_round_num: q.round_num,
+    };
+
+    Ok((auto_cleared, next_str, new_stage, new_streak, snapshot))
+}
+
+/// Cleanly amend a previous failed short-answer submission without double-counting or polluting wrong_count!
+pub fn amend_manual_override_pass(
+    conn: &Connection,
+    question_id: &str,
+    snap: &ReviewSnapshot,
+    auto_clear_streak: i32,
+) -> Result<(bool, String, i32, i32), String> {
+    let current_round = get_current_round(conn)?;
+    let now_dt = Local::now();
+    let now_str = now_dt.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let stage = (snap.prev_stage + 1).min((EBBINGHAUS_MINUTES.len() - 1) as i32);
+    let streak = snap.prev_streak + 1;
+    let mins = EBBINGHAUS_MINUTES[stage as usize];
+    let should_clear = auto_clear_streak > 0 && streak >= auto_clear_streak;
+    let status = if should_clear { "cleared" } else { "active" };
+    let next_str = (now_dt + Duration::minutes(mins))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    conn.execute(
+        "UPDATE questions
+         SET ebbinghaus_stage = ?1, streak = ?2, wrong_count = ?3, correct_count = ?4,
+             next_review_at = ?5, status = ?6, round_num = MAX(?7, ?8), updated_at = ?9
+         WHERE id = ?10",
+        params![
+            stage,
+            streak,
+            snap.prev_wrong_count,
+            snap.prev_correct_count + 1,
+            next_str,
+            status,
+            snap.prev_round_num,
+            current_round,
+            now_str,
+            question_id
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Update the original review_log row in-place so today_answered & accuracy stay 100% accurate
+    conn.execute(
+        "UPDATE review_logs
+         SET is_correct = 1, score_percent = 100, manual_override = 1
+         WHERE id = ?1",
+        params![snap.log_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok((should_clear, next_str, stage, streak))
 }
 
 pub fn get_dashboard_stats(conn: &Connection) -> Result<DashboardStats, String> {
@@ -684,6 +1179,8 @@ pub fn get_dashboard_stats(conn: &Connection) -> Result<DashboardStats, String> 
         0
     };
 
+    let round_progress = get_round_progress(conn)?;
+
     Ok(DashboardStats {
         total_questions,
         active_questions,
@@ -691,10 +1188,38 @@ pub fn get_dashboard_stats(conn: &Connection) -> Result<DashboardStats, String> 
         due_now,
         today_answered,
         today_accuracy,
+        round_progress,
     })
 }
 
-#[allow(dead_code)]
-pub fn is_valid_iso(s: &str) -> bool {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").is_ok()
+/// 90-day learning activity heatmap aggregation
+pub fn get_activity_heatmap(conn: &Connection, days: i64) -> Result<Vec<HeatmapDay>, String> {
+    let safe_days = days.clamp(7, 365);
+    let start_date = (Local::now() - Duration::days(safe_days - 1))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(reviewed_at, 1, 10) AS day,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) AS correct
+             FROM review_logs
+             WHERE substr(reviewed_at, 1, 10) >= ?1
+             GROUP BY day
+             ORDER BY day ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![start_date], |r| {
+            Ok(HeatmapDay {
+                date: r.get(0)?,
+                total: r.get(1)?,
+                correct: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }

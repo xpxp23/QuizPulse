@@ -14,8 +14,11 @@
     "core:window:allow-maximize",
     "core:window:allow-unmaximize",
     "core:window:allow-center",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
     "core:event:default",
     "dialog:default",
-    "autostart:default"
+    "autostart:default",
+    "global-shortcut:default"
   ]
 }

@@ -64,7 +64,7 @@ pub struct Bank {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceOption {
-    pub key: String,  // "A", "B", "C", "D"...
+    pub key: String, // "A", "B", "C", "D"...
     pub text: String,
 }
 
@@ -76,11 +76,7 @@ pub struct Question {
     pub q_type: QuestionType,
     pub stem: String,
     pub options: Vec<ChoiceOption>,
-    /// For single/multi choice: ["A"] or ["A", "C"]
-    /// For fill_blank: each element is one blank's synonym group like "HTTP/http"
-    /// For short_answer: reference full answer text
     pub answers: Vec<String>,
-    /// For short_answer: list of scoring points; each point may contain "/" synonyms, e.g. "三次握手/3次握手"
     pub keywords: Vec<String>,
     pub explanation: String,
     pub order_insensitive: bool,
@@ -90,14 +86,35 @@ pub struct Question {
     pub correct_count: i32,
     pub next_review_at: String,
     pub status: String, // "active" | "cleared"
+    pub round_num: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionUpsertRequest {
+    pub id: Option<String>,
+    pub bank_id: String,
+    pub q_type: QuestionType,
+    pub stem: String,
+    pub options: Vec<ChoiceOption>,
+    pub answers: Vec<String>,
+    pub keywords: Vec<String>,
+    pub explanation: String,
+    pub order_insensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedQuestions {
+    pub items: Vec<Question>,
+    pub total: i64,
+    pub page: u32,
+    pub page_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuizSessionQuestion {
     pub question: Question,
-    /// Shuffled display options for choice questions; key maps back to original option key
     pub display_options: Vec<ChoiceOption>,
 }
 
@@ -109,11 +126,19 @@ pub struct KeywordMatchDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewSnapshot {
+    pub log_id: i64,
+    pub prev_stage: i32,
+    pub prev_streak: i32,
+    pub prev_wrong_count: i32,
+    pub prev_correct_count: i32,
+    pub prev_status: String,
+    pub prev_round_num: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GradeRequest {
     pub question_id: String,
-    /// For single/multi choice: selected original keys ["A"] or ["A", "C"]
-    /// For fill_blank: user's input for each blank
-    /// For short_answer: single element containing full answer text
     pub user_answers: Vec<String>,
 }
 
@@ -130,9 +155,31 @@ pub struct GradeResult {
     pub next_review_at: String,
     pub ebbinghaus_stage: i32,
     pub streak: i32,
+    pub snapshot: Option<ReviewSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualOverrideRequest {
+    pub question_id: String,
+    pub snapshot: ReviewSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundProgress {
+    pub current_round: i64,
+    pub completed_in_round: i64,
+    pub total_active: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeatmapDay {
+    pub date: String, // "YYYY-MM-DD"
+    pub total: i64,
+    pub correct: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub interval_minutes: u32,
     pub questions_per_session: u32,
@@ -142,6 +189,16 @@ pub struct AppSettings {
     pub short_answer_pass_percent: u8,
     pub fullscreen_dnd: bool,
     pub shuffle_options: bool,
+    /// "shuffle_round" (不放回轮次随机) | "ebbinghaus" (艾宾浩斯智能复习) | "sequential" (严格顺序)
+    pub study_order: String,
+    /// Whether to still interleave due wrong questions during shuffle_round / sequential modes
+    pub interleave_due_wrong: bool,
+    /// Instant submit when selecting a single-choice option (click or press 1-6)
+    pub instant_single_choice: bool,
+    /// Subtle Web Audio chime feedback
+    pub sound_enabled: bool,
+    /// Global hotkey to summon quiz popup immediately, e.g. "Alt+Q" (empty to disable)
+    pub global_shortcut: String,
     pub popup_position: String, // "center" | "bottom_right"
     pub theme: String,          // "system" | "light" | "dark"
     pub auto_start: bool,
@@ -159,6 +216,11 @@ impl Default for AppSettings {
             short_answer_pass_percent: 60,
             fullscreen_dnd: true,
             shuffle_options: true,
+            study_order: "shuffle_round".to_string(),
+            interleave_due_wrong: true,
+            instant_single_choice: false,
+            sound_enabled: true,
+            global_shortcut: "Alt+Q".to_string(),
             popup_position: "bottom_right".to_string(),
             theme: "system".to_string(),
             auto_start: true,
@@ -174,6 +236,7 @@ pub struct TimerStatus {
     pub paused_manual: bool,
     pub paused_auto_reason: Option<String>,
     pub popup_open: bool,
+    pub round_progress: RoundProgress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,4 +255,5 @@ pub struct DashboardStats {
     pub due_now: i64,
     pub today_answered: i64,
     pub today_accuracy: u8,
+    pub round_progress: RoundProgress,
 }
